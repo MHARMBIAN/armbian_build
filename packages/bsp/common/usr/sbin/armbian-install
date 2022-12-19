@@ -37,8 +37,11 @@ FIRSTSECTOR=32768
 #recognize_root
 root_uuid=$(sed -e 's/^.*root=//' -e 's/ .*$//' < /proc/cmdline)
 root_partition=$(blkid | tr -d '":' | grep "${root_uuid}" | awk '{print $1}')
-root_partition_device=$(lsblk -ndo pkname $root_partition)
-root_partition_device_name=$(echo $root_partition_device | sed 's/\/dev\///g')
+#@mhoffrog additional feature: exclude current root partition from selection
+root_partition_name=$(echo $root_partition | sed 's/\/dev\///g')
+#@mhoffrog additional fix:
+root_partition_device_name=$(lsblk -ndo pkname $root_partition)
+root_partition_device=/dev/$root_partition_device_name
 
 # find targets: NAND, EMMC, SATA, SPI flash, NVMe
 [[ -b /dev/nand ]] && nandcheck=$(ls -d -1 /dev/nand* | grep -w 'nand' | awk '{print $NF}');
@@ -92,9 +95,16 @@ create_armbian()
 	# UUID=xxx...
 	satauuid=$(blkid -o export "$2" | grep -w UUID)
 
-	# SD card boot part -- wrong since more than one entry on various platforms
+	# SD card boot part - to be considered more than one entry on various platforms
 	# UUID=xxx...
-	sduuid=$(blkid -o export /dev/mmcblk*p1 | grep -w UUID | grep -v "$root_partition_device")
+	#@mhoffrog additional fix:
+	#sduuid=$(blkid -o export /dev/mmcblk*p1 | grep -w UUID | grep -v "$root_partition_device")
+	# First lookup mmc devices excluding the mmc device probably providing the current root partition:
+	sdblkid=$(blkid -o full /dev/mmcblk*p1 | grep -v "$root_partition_device")
+	# If there is nothing, then lookup any mmc partition matching /dev/mmcblk*p1:
+	[[ -z $sdblkid ]] && sdblkid=$(blkid -o full /dev/mmcblk*p1)
+	# Extract the UUID from $sdblkid:
+	sduuid=$(echo "$sdblkid" | sed -nE 's/^.*[[:space:]]UUID="([0-9a-zA-Z-]*)".*/\1/p')
 
 	# write information to log
 	echo -e "\nOld UUID:  ${root_uuid}" >> $logfile
@@ -363,7 +373,7 @@ create_armbian()
 		# create swap file size of your memory so we can use it for S4
 		MEM_TOTAL=$(cat /proc/meminfo | awk '/MemTotal/ {print $2}')
 
-		# but no more then 16Gb
+		# but no more then 16GB
 		[[ ${MEM_TOTAL} -gt 16107868 ]] && MEM_TOTAL=16107868
 		dd if=/dev/zero of="${TempDir}"/rootfs/swapfile bs=${MEM_TOTAL} count=1024 conv=notrunc
 
@@ -632,13 +642,32 @@ check_partitions()
 	IFS=" "
 	[[ -n "$1" ]] && EXCLUDE=" | grep -v $1"
 	[[ -n "$2" ]] && INCLUDE=" | grep $2" && diskcheck=$2
-	CMD="lsblk -io KNAME,FSTYPE,SIZE,TYPE,MOUNTPOINT $INCLUDE $EXCLUDE | grep -E '^sd|^nvme|^md|^mmc' | awk -F\" \" '/ part | raid..? / {print \$1}'"
+	#@mhoffrog additional feature: exclude current root partition from selection
+	CMD="lsblk -io KNAME,FSTYPE,SIZE,TYPE,MOUNTPOINT | grep -vw $root_partition_name $INCLUDE $EXCLUDE | grep -E '^sd|^nvme|^md|^mmc' | awk -F\" \" '/ part | raid..? / {print \$1}'"
 	AvailablePartitions=$(eval $CMD)
 	if [[ -z $AvailablePartitions ]]; then
-		FREE_SPACE=$(parted /dev/$diskcheck unit GB print free | awk '/Free Space/{c++; sum += $3; print sum}' | tail -1)
-		dialog --yes-label "Proceed" --no-label 'Exit' --title "$title" --backtitle "$backtitle" --yesno "\nDestination $diskcheck has $FREE_SPACE Gb of available space. \n\nAutomated install will generate needed partitions!" 9 55
-		if [[ "${FREE_SPACE%.*}" -gt 4 && $? == 0 ]]; then
-			if [[ "$DEVICE_TYPE" == uefi && -z "$efi_partition" ]]; then
+		#@mhoffrog handle brand new device or a device with a wiped partition table:
+		if [[ -z $(blkid /dev/$diskcheck) ]]; then
+			# There is not yet any partition table on the disk device.
+			# => we have to calc the size in GB directly from the device.
+			FREE_SPACE=$(echo "scale=0; $(blockdev --getsize64 /dev/$diskcheck)/1024^3" | bc -l)
+		else
+			# The device has an initial partition table
+			FREE_SPACE=$(parted /dev/$diskcheck unit GB print free | awk '/Free Space/{c++; sum += $3; print sum}' | tail -1)
+		fi
+		#@mhoffrog improve logic:
+		#  1. Check for minimum free spce of 4GB
+		#  2. Ask user to proceed with auto-created partition(s) or not
+		#  3. Distinguish between UEFI and non UEFI device
+		#
+		if [[ "${FREE_SPACE%.*}" -lt 4 ]]; then
+			dialog --ok-label 'Exit' --title ' Warning ' --backtitle "$backtitle" --colors --no-collapse --msgbox "\n\Z1There is not enough free capacity on /dev/$diskcheck. Please check your device.\Zn" 7 52
+			exit 11
+		fi
+		dialog --yes-label "Proceed" --no-label 'Exit' --title "$title" --backtitle "$backtitle" --yesno "\nDestination $diskcheck has ${FREE_SPACE}GB of available space. \n\nAutomated install will generate needed partition(s)!" 9 55
+		[[ $? -ne 0 ]] && exit 11
+		if [[ "$DEVICE_TYPE" == uefi ]]; then
+			if [[ -z "$efi_partition" ]]; then
 				wipefs -aq /dev/$diskcheck
 				# create EFI partition
 				{
@@ -657,12 +686,16 @@ check_partitions()
 			# re-read
 			emmccheck=$(ls -d -1 /dev/mmcblk* 2>/dev/null | grep -w 'mmcblk[0-9]' | grep -v "$root_partition_device");
 			efi_partition=$(LC_ALL=C fdisk -l "/dev/$diskcheck" 2>/dev/null | grep "EFI" | awk '{print $1}')
-
 		else
-			exit 11
+			# Create new partition of max free size
+			{
+				echo n; echo ; echo ; echo ; echo
+				echo w
+			} | fdisk /dev/$diskcheck &> /dev/null || true
 		fi
 	fi
-	CMD="lsblk -io KNAME,FSTYPE,SIZE,TYPE,MOUNTPOINT $INCLUDE $EXCLUDE | grep -E '^sd|^nvme|^md|^mmc' | awk -F\" \" '/ part | raid..? / {print \$1}' | uniq | sed 's|^|/dev/|' | nl | xargs echo -n"
+	#@mhoffrog additional feature: exclude current root partition from selection
+	CMD="lsblk -io KNAME,FSTYPE,SIZE,TYPE,MOUNTPOINT | grep -vw $root_partition_name $INCLUDE $EXCLUDE | grep -E '^sd|^nvme|^md|^mmc' | awk -F\" \" '/ part | raid..? / {print \$1}' | uniq | sed 's|^|/dev/|' | nl | xargs echo -n"
 	partprobe
 	AvailablePartitions=$(eval $CMD)
 	PartitionOptions=($AvailablePartitions)
@@ -754,7 +787,7 @@ main()
 
 	else
 
-		[[ -n $diskcheck ]] 						&& options+=(1 'Boot from SD - system on SATA, USB or NVMe')
+		[[ -n $sduuid    && -n $diskcheck ]] 				&& options+=(1 'Boot from SD - system on SATA, USB or NVMe')
 		[[ -n $emmccheck ]] 						&& options+=(2 "Boot from $ichip - system on $ichip")
 		[[ -n $emmccheck && -n $diskcheck ]] 				&& options+=(3 "Boot from $ichip - system on SATA, USB or NVMe")
 		[[ -n $spicheck ]] 						&& options+=(4 'Boot from SPI  - system on SATA, USB or NVMe')
